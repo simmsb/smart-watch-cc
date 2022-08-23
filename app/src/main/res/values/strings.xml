@@ -1,0 +1,8 @@
+<resources>
+    <string name="app_name">smartwatch-sync</string>
+    <string name="title_home">Home</string>
+    <string name="title_dashboard">Dashboard</string>
+    <string name="title_notifications">Notifications</string>
+    <string name="gatt_service_name">Smartwatch BLE</string>
+    <string name="gatt_service_running_notification">Managing ble stuff</string>
+</resources>
