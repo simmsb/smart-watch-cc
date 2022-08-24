@@ -10,23 +10,21 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.util.Log
-import android.widget.TextView
+import android.widget.*
 import androidx.activity.result.contract.ActivityResultContracts
-import com.google.android.material.bottomnavigation.BottomNavigationView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
-import androidx.navigation.findNavController
-import androidx.navigation.ui.AppBarConfiguration
-import androidx.navigation.ui.setupActionBarWithNavController
-import androidx.navigation.ui.setupWithNavController
 import com.example.smartwatch_sync.databinding.ActivityMainBinding
+import com.example.smartwatchsync.*
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
+import no.nordicsemi.android.ble.ktx.BuildConfig
 
 class MainActivity : AppCompatActivity() {
 
+    private lateinit var pins: Map<Pins, Pin>
     private lateinit var binding: ActivityMainBinding
 
     private val defaultScope = CoroutineScope(Dispatchers.Default)
@@ -37,7 +35,7 @@ class MainActivity : AppCompatActivity() {
 
     private var bleServiceData: BleService.DataPlane? = null
 
-    private val myCharacteristicValueChangeNotifications = Channel<String>()
+    private val notifications = Channel<Notification>()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -73,21 +71,46 @@ class MainActivity : AppCompatActivity() {
             ) == PackageManager.PERMISSION_GRANTED
         }.toTypedArray()
 
+        addRows()
+
         if (missing.isNotEmpty()) {
             Log.i("Requesting perms: ", missing.toString())
             requestPermissionLauncher.launch(missing)
         } else {
             startup()
         }
+
+        val readButton = findViewById<Button>(R.id.read_button)
+        readButton.setOnClickListener {
+            pins.values.forEach {
+                if (it.mode == PinOperation.AnalogueRead) {
+                    val msg = message {
+                        origin = 3387062
+                        setPin = SetPin.newBuilder()
+                            .setPin(it.pin)
+                            .setOp(PinOperation.AnalogueRead)
+                            .build()
+                    }
+                    sendMessage(msg)
+                }
+            }
+        }
+    }
+
+    fun sendMessage(msg: Message) {
+        Log.i("Sending message: ", msg.toString())
+        bleServiceData?.sendMessage(msg)
     }
 
     private fun startup() {
         val gattCharacteristicValue = findViewById<TextView>(R.id.status_text)
 
         defaultScope.launch {
-            for (newValue in myCharacteristicValueChangeNotifications) {
+            for (newValue in notifications) {
                 mainHandler.run {
-                    gattCharacteristicValue.text = newValue
+                    newValue.pinReadOrNull?.let {
+                        pins[it.pin]?.setResult(it.value)
+                    }
                 }
             }
         }
@@ -134,8 +157,54 @@ class MainActivity : AppCompatActivity() {
             else {
                 bleServiceData = service as BleService.DataPlane
 
-                bleServiceData?.setMyCharacteristicChangedChannel(myCharacteristicValueChangeNotifications)
+                bleServiceData?.setNotificationChangedChannel(notifications)
+
             }
+        }
+    }
+
+    private fun addRows() {
+        val table = findViewById<TableLayout>(R.id.pin_table)
+        val pins = arrayOf(
+            Pin(Pins.G26, "G26", this),
+            Pin(Pins.G25, "G25", this),
+            Pin(Pins.G0, "G0", this),
+        )
+
+        val operations = arrayOf(
+            PinOperation.SetLow,
+            PinOperation.SetHigh,
+            PinOperation.AnalogueRead
+        )
+
+        this.pins = pins.associateBy { pin ->
+            val tableRow = TableRow(table.context)
+            val name = TextView(this)
+            name.text = pin.name
+            tableRow.addView(name)
+
+            val radios = operations.map { operation ->
+                val button = RadioButton(this)
+                tableRow.addView(button)
+
+                if (operation == PinOperation.SetLow) {
+                    button.isChecked = true
+                }
+
+                button.setOnClickListener {
+                    pin.onClickHandlerFor(button, operation)
+                }
+
+                button
+            }
+
+            pin.radios = radios
+            val result = TextView(this)
+            pin.result = result
+            tableRow.addView(result)
+            table.addView(tableRow)
+
+            pin.pin
         }
     }
 }

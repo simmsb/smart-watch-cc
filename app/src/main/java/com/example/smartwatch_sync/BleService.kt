@@ -12,16 +12,17 @@ import android.content.IntentFilter
 import android.os.*
 import android.util.Log
 import androidx.core.app.NotificationCompat
-import com.example.smartwatchsync.SyncClockKt
+import com.example.smartwatchsync.Message
+import com.example.smartwatchsync.Notification
 import com.example.smartwatchsync.message
 import com.example.smartwatchsync.syncClock
-import com.google.protobuf.Timestamp
 import com.google.protobuf.timestamp
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.SendChannel
 import kotlinx.coroutines.launch
 import no.nordicsemi.android.ble.BleManager
+import java.time.Instant
 import java.util.*
 
 
@@ -50,7 +51,7 @@ class BleService : Service() {
 
     private lateinit var bluetoothObserver: BroadcastReceiver
 
-    private var myCharacteristicChangedChannel: SendChannel<String>? = null
+    private var deviceNotificationChannel: SendChannel<Notification>? = null
 
     private val clientManagers = mutableMapOf<String, ClientManager>()
 
@@ -130,7 +131,7 @@ class BleService : Service() {
     override fun onUnbind(intent: Intent?): Boolean =
         when (intent?.action) {
             DATA_PLANE_ACTION -> {
-                myCharacteristicChangedChannel = null
+                deviceNotificationChannel = null
                 true
             }
             else -> false
@@ -140,8 +141,16 @@ class BleService : Service() {
      * A binding to be used to interact with data of the service
      */
     inner class DataPlane : Binder() {
-        fun setMyCharacteristicChangedChannel(sendChannel: SendChannel<String>) {
-            myCharacteristicChangedChannel = sendChannel
+        fun setNotificationChangedChannel(sendChannel: SendChannel<Notification>) {
+            deviceNotificationChannel = sendChannel
+        }
+
+        fun sendMessage(msg: Message) {
+            val data = msg.toByteArray()
+
+            clientManagers.values.forEach {
+                it.sendToMessageChar(data)
+            }
         }
     }
 
@@ -189,22 +198,33 @@ class BleService : Service() {
     private inner class ClientManager : BleManager(this@BleService) {
         override fun getGattCallback(): BleManagerGattCallback = GattCallback()
 
+        private var notificationChar: BluetoothGattCharacteristic? = null
+
+        private var messageWriteChar: BluetoothGattCharacteristic? = null
+
         override fun log(priority: Int, message: String) {
             if (BuildConfig.DEBUG || priority == Log.ERROR) {
                 Log.println(priority, TAG, message)
             }
         }
 
-        private inner class GattCallback : BleManagerGattCallback() {
+        fun sendToMessageChar(value: ByteArray) {
+            writeCharacteristic(messageWriteChar, value, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
+                .enqueue()
+        }
 
-            private var myCharacteristic: BluetoothGattCharacteristic? = null
+        private inner class GattCallback : BleManagerGattCallback() {
 
             override fun isRequiredServiceSupported(gatt: BluetoothGatt): Boolean {
                 val service = gatt.getService(MyServiceProfile.MY_SERVICE_UUID)
-                myCharacteristic =
-                    service?.getCharacteristic(MyServiceProfile.MY_CHARACTERISTIC_UUID)
-                val myCharacteristicProperties = myCharacteristic?.properties ?: 0
-                return (myCharacteristicProperties and BluetoothGattCharacteristic.PROPERTY_WRITE != 0)
+                messageWriteChar =
+                    service?.getCharacteristic(MyServiceProfile.MESSAGE_WRITE_UUID)
+                notificationChar =
+                    service?.getCharacteristic(MyServiceProfile.NOTIFICATION_UUID)
+                val messageWriteProperties = messageWriteChar?.properties ?: 0
+                val notificationProperties = notificationChar?.properties ?: 0
+                return (messageWriteProperties and BluetoothGattCharacteristic.PROPERTY_WRITE != 0) &&
+                        (notificationProperties and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0)
             }
 
             override fun initialize() {
@@ -212,7 +232,7 @@ class BleService : Service() {
 
                 requestMtu(517).enqueue();
 
-                val now = Calendar.getInstance().toInstant();
+                val now = Instant.now()
                 val sync = syncClock {
                     timestamp = timestamp {
                         seconds = now.epochSecond
@@ -224,39 +244,41 @@ class BleService : Service() {
                     syncClock = sync
                 }
 
-                writeCharacteristic(myCharacteristic, message.toByteArray(), BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
+                writeCharacteristic(messageWriteChar, message.toByteArray(), BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
                     .enqueue()
 
-//                setNotificationCallback(myCharacteristic).with { _, data ->
-//                    if (data.value != null) {
-//                        val value = String(data.value!!, Charsets.UTF_8)
-//                        defaultScope.launch {
-//                            myCharacteristicChangedChannel?.send(value)
-//                        }
-//                    }
-//                }
-//
-//                beginAtomicRequestQueue()
-//                    .add(enableNotifications(myCharacteristic)
-//                        .fail { _: BluetoothDevice?, status: Int ->
-//                            log(Log.ERROR, "Could not subscribe: $status")
-//                            disconnect().enqueue()
-//                        }
-//                    )
-//                    .done {
-//                        log(Log.INFO, "Target initialized")
-//                    }
-//                    .enqueue()
+                setNotificationCallback(notificationChar).with { _, data ->
+                    if (data.value != null) {
+                        val msg = Notification.parseFrom(data.value!!)
+                        defaultScope.launch {
+                            deviceNotificationChannel?.send(msg)
+                        }
+                    }
+                }
+
+                beginAtomicRequestQueue()
+                    .add(enableNotifications(notificationChar)
+                        .fail { _: BluetoothDevice?, status: Int ->
+                            log(Log.ERROR, "Could not subscribe: $status")
+                            disconnect().enqueue()
+                        }
+                    )
+                    .done {
+                        log(Log.INFO, "Target initialized")
+                    }
+                    .enqueue()
             }
 
             override fun onServicesInvalidated() {
-                myCharacteristic = null
+                messageWriteChar = null
+                notificationChar = null
             }
         }
     }
 
     object MyServiceProfile {
         val MY_SERVICE_UUID: UUID = UUID.fromString("98200001-2160-4474-82b4-1a25cef92156")
-        val MY_CHARACTERISTIC_UUID: UUID = UUID.fromString("98200002-2160-4474-82b4-1a25cef92156")
+        val MESSAGE_WRITE_UUID: UUID = UUID.fromString("98200002-2160-4474-82b4-1a25cef92156")
+        val NOTIFICATION_UUID: UUID = UUID.fromString("98200003-2160-4474-82b4-1a25cef92156")
     }
 }
